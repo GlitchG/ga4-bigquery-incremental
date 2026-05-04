@@ -51,7 +51,7 @@ SELECT
   is_active_user,
   (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
   (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id
-FROM `${dataform.projectConfig.vars.ga4_project}.${dataform.projectConfig.vars.ga4_dataset}.events_*`
+FROM `${constants.PROJECT_ID}.${constants.GA4_DATASET}.events_*`
 WHERE _table_suffix BETWEEN
   FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
   AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())

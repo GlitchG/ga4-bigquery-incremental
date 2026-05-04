@@ -64,7 +64,7 @@ WITH raw_events AS (
     device,
     geo,
     'daily' AS _export_type
-  FROM `${dataform.projectConfig.vars.ga4_project}.${dataform.projectConfig.vars.ga4_dataset}.events_*`
+  FROM `${constants.PROJECT_ID}.${constants.GA4_DATASET}.events_*`
   WHERE _table_suffix BETWEEN
     FORMAT_DATE('%Y%m%d', DATE_TRUNC(CURRENT_DATE(), MONTH))
     AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
@@ -93,7 +93,7 @@ WITH raw_events AS (
     device,
     geo,
     'intraday' AS _export_type
-  FROM ``${dataform.projectConfig.vars.ga4_project}.${dataform.projectConfig.vars.ga4_dataset}`.events_intraday_*`
+  FROM ``${constants.PROJECT_ID}.${constants.GA4_DATASET}`.events_intraday_*`
   WHERE _table_suffix BETWEEN
     FORMAT_DATE('intraday_%Y%m%d', DATE_TRUNC(CURRENT_DATE(), MONTH))
     AND FORMAT_DATE('intraday_%Y%m%d', CURRENT_DATE())
