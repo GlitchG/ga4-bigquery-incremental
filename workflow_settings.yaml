@@ -1,3 +1,10 @@
-defaultProject: my-gcp-project
-defaultDataset: analytics
+dataformCoreVersion: "3.0.20"
+defaultProject: your-gcp-project
 defaultLocation: EU
+defaultDataset: analytics
+defaultAssertionDataset: analytics_assertions
+vars:
+  ga4_project: "bigquery-public-data"
+  ga4_dataset: "ga4_obfuscated_sample_ecommerce"
+  lookback_days: 3
+  mp_lookback_days: 60

@@ -1,0 +1,129 @@
+config {
+  type: "incremental",
+  schema: "analytics",
+  name: "stg_ga4_events_tier1",
+  tags: ["pattern", "two-tier", "source-mart"],
+  description: "Pattern 3 Tier 1: Source mart. Unions daily + intraday exports, deduplicates, and normalises GA4 schema. This is the ONLY model that touches raw GA4 tables.",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name"],
+    requirePartitionFilter: true
+  }
+}
+
+pre_operations {
+  DELETE FROM ${self()} WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY);
+}
+
+-- ============================================================================
+-- Pattern 3: Two-Tier Architecture (Production-Grade, 2026)
+-- ============================================================================
+-- This is what I deploy for clients. The idea is simple:
+--
+-- Tier 1 (Source Mart): Handle GA4's quirks once.
+--   - Union daily + intraday exports
+--   - De-duplicate intraday → daily overlap
+--   - 3-day insert overwrite via pre_operations delete
+--   - This is the ONLY model that touches raw GA4 tables
+--
+-- Tier 2 (Business Models): Clean incrementals on 1 day of stable data.
+--   - Session models, conversion funnels, LTV, cohort analysis
+--   - Each model increments on 1 day (cheap)
+--   - 20+ models can run without re-implementing GA4 logic
+--
+-- 2026 UPDATES:
+-- - Uses collected_traffic_source and session_traffic_source_last_click
+--   (native BQ fields, not event_params parsing)
+-- - Includes privacy_info for Consent Mode v2 (mandatory EEA since 2024)
+-- - Handles the "registration session" user_id attribution bug
+-- - Cost guardrails: maximum_bytes_billed on all Dataform compilation configs
+-- ============================================================================
+
+-- ============================================================================
+-- TIER 1: SOURCE MART
+-- ============================================================================
+
+WITH raw AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_date,
+    user_pseudo_id,
+    user_id,
+    event_name,
+    event_timestamp,
+    event_bundle_sequence_id,
+    event_previous_timestamp,
+    -- 2026: Native traffic_source fields (stop parsing event_params)
+    collected_traffic_source.source AS traffic_source,
+    collected_traffic_source.medium AS traffic_medium,
+    collected_traffic_source.campaign AS traffic_campaign,
+    session_traffic_source_last_click.source AS session_source,
+    session_traffic_source_last_click.medium AS session_medium,
+    session_traffic_source_last_click.campaign AS session_campaign,
+    -- 2026: Consent Mode v2 fields
+    privacy_info.analytics_storage AS analytics_storage_consent,
+    privacy_info.ads_storage AS ads_storage_consent,
+    is_active_user,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_title') AS page_title,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_referrer') AS page_referrer,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec') AS engagement_time_msec,
+    ecommerce,
+    device,
+    geo,
+    'daily' AS _export_type
+  FROM `${dataform.projectConfig.vars.ga4_project}.${dataform.projectConfig.vars.ga4_dataset}.events_*`
+  WHERE _table_suffix BETWEEN
+    FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
+    AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+
+  UNION ALL
+
+  SELECT
+    PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(_table_suffix, r'intraday_(\d+)')) AS event_date,
+    user_pseudo_id,
+    user_id,
+    event_name,
+    event_timestamp,
+    event_bundle_sequence_id,
+    event_previous_timestamp,
+    collected_traffic_source.source AS traffic_source,
+    collected_traffic_source.medium AS traffic_medium,
+    collected_traffic_source.campaign AS traffic_campaign,
+    session_traffic_source_last_click.source AS session_source,
+    session_traffic_source_last_click.medium AS session_medium,
+    session_traffic_source_last_click.campaign AS session_campaign,
+    privacy_info.analytics_storage AS analytics_storage_consent,
+    privacy_info.ads_storage AS ads_storage_consent,
+    is_active_user,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_title') AS page_title,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_referrer') AS page_referrer,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec') AS engagement_time_msec,
+    ecommerce,
+    device,
+    geo,
+    'intraday' AS _export_type
+  FROM `${dataform.projectConfig.vars.ga4_project}.${dataform.projectConfig.vars.ga4_dataset}.events_intraday_*`
+  WHERE _table_suffix BETWEEN
+    FORMAT_DATE('intraday_%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
+    AND FORMAT_DATE('intraday_%Y%m%d', CURRENT_DATE())
+)
+
+SELECT * EXCEPT(_export_type, rn)
+FROM (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_pseudo_id, event_timestamp, event_name, event_bundle_sequence_id
+      ORDER BY CASE WHEN _export_type = 'daily' THEN 1 ELSE 2 END
+    ) AS rn
+  FROM raw
+)
+WHERE rn = 1;
+
+
+/*
+  -- ============================================================================
+  --

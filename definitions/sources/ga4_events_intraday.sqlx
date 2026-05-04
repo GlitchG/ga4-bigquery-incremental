@@ -1,0 +1,7 @@
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.ga4_project,
+  schema: dataform.projectConfig.vars.ga4_dataset,
+  name: "ga4_events_intraday",
+  description: "External GA4 BigQuery intraday export (sharded by date)."
+}

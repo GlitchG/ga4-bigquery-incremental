@@ -1,0 +1,7 @@
+.brain/
+node_modules/
+.df-cache/
+.env
+*.log
+.ruff_cache/
+__pycache__/
