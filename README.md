@@ -18,6 +18,7 @@ Challenges this creates:
 2. **Dual tables**: intraday data is incomplete but fresh; daily data is complete but stale
 3. **No unique key**: `event_timestamp + user_pseudo_id` is not guaranteed unique (batch uploads, retries)
 4. **Schema drift**: Google adds new event parameters without warning
+5. **Measurement Protocol backdating**: MP events, offline conversions, and CRM imports can land in partitions 15-30+ days old — completely invisible to a 3-day overwrite
 
 ## The Patterns
 
@@ -80,6 +81,18 @@ Every incremental pipeline needs guardrails. I run these checks after each refre
 
 See: [`sql/04_validation.sql`](sql/04_validation.sql)
 
+### Pattern 5: Monthly Deep Backfill (Measurement Protocol / Offline Events)
+
+The 3-day insert overwrite (Pattern 1) silently misses **Measurement Protocol events**, offline conversion imports, and CRM-synced data that is backdated 15-30+ days. These events land in old partitions your daily pipeline never touches.
+
+**Solution:** Keep the fast 3-day overwrite for daily freshness, but run a monthly job that rebuilds the last 60-90 days. It catches stragglers without blowing up daily costs.
+
+**Schedule:** 1st of each month at 03:00 UTC via Airflow, Cloud Composer, dbt Cloud, or cron.
+
+**Cost impact:** One monthly run of 60 days ≈ €8-15. Negligible compared to daily full refreshes.
+
+See: [`sql/05_measurement_protocol_backfill.sql`](sql/05_measurement_protocol_backfill.sql)
+
 ## When to Use What
 
 | Scenario | Pattern | Why |
@@ -88,6 +101,7 @@ See: [`sql/04_validation.sql`](sql/04_validation.sql)
 | Production, > 10M events/month | Insert overwrite | Cost control + handles late data |
 | Multiple teams/dashboards | Two-tier | Isolates complexity, enables reuse |
 | Real-time dashboards needed | Two-tier + today table | Near-real-time without destabilising history |
+| CRM/offline conversions imported monthly | Two-tier + monthly backfill | Catches backdated MP events |
 
 ## Files
 
@@ -97,6 +111,7 @@ sql/
   02_date_checkpoint.sql       # Pattern 2: High-water mark append
   03_two_tier_pipeline.sql     # Pattern 3: Source mart + business models
   04_validation.sql            # Data quality checks
+  05_measurement_protocol_backfill.sql  # Pattern 5: 60-day monthly rebuild
 ```
 
 ## License
