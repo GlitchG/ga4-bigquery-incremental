@@ -6,5 +6,5 @@ defaultAssertionDataset: analytics_assertions
 vars:
   ga4_project: "bigquery-public-data"
   ga4_dataset: "ga4_obfuscated_sample_ecommerce"
-  lookback_days: 3
-  mp_lookback_days: 60
+  lookback_days: "3"
+  mp_lookback_days: "60"
