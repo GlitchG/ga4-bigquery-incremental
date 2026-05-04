@@ -1,30 +1,47 @@
 /*
-  Pattern 1: Insert Overwrite (Recommended)
-  
+  Pattern 1: Insert Overwrite (Recommended for 2026)
+
   Replace the last 3 days of data on every run. This handles:
   - Intraday updates (today's data changes hourly)
   - Daily export backfills (Google re-processes yesterday with corrections)
-  - Late-arriving events (up to 72h delay)
-  
-  Why not MERGE? BigQuery MERGE scans the entire target partition to find
-  matching rows. On 100M+ row tables, that's €3-5/day vs €0.40-0.80 for
-  insert overwrite. At scale, this matters.
+  - Late-arriving native events (up to 72h delay)
+  - Measurement Protocol events (see Pattern 5 for backdated MP)
+
+  WHY NOT MERGE?
+  BigQuery MERGE scans the entire target partition to find matching rows.
+  On 100M+ row tables, that's €3-5/day vs €0.40-0.80 for insert overwrite.
+  At scale, this matters.
+
+  2026 UPDATES vs 2023-era advice:
+  - dbt: use incremental_predicates (partitions= is deprecated in dbt 1.7+)
+  - Uses native collected_traffic_source (not event_params parsing)
+  - Includes privacy_info for Consent Mode v2 compliance
+  - Includes session_traffic_source_last_click for reliable attribution
 */
 
--- In dbt, this is config:
+-- ============================================================================
+-- dbt config (2026 syntax)
+-- ============================================================================
 -- {{ config(
 --     materialized='incremental',
 --     partition_by={'field': 'event_date', 'data_type': 'date'},
 --     incremental_strategy='insert_overwrite',
---     partitions=[
---         "date_sub(current_date(), interval 3 day)",
---         "date_sub(current_date(), interval 2 day)",
---         "date_sub(current_date(), interval 1 day)",
---         "current_date()"
---     ]
+--     incremental_predicates=[
+--       "event_date >= date_sub(current_date(), interval 3 day)"
+--     ],
+--     on_schema_change='sync_all_columns'
 -- ) }}
 
--- Pure SQL equivalent (for Dataform, Airflow, or manual runs):
+-- ============================================================================
+-- Pure SQL equivalent (Dataform, Airflow, manual)
+-- ============================================================================
+
+-- COST GUARDRAIL: Always set maximum_bytes_billed in your job config
+-- BigQuery: --maximum_bytes_billed=107374182400  (100 GiB = ~€0.50)
+-- dbt:      +jobs:<job_name>:
+--             +extra_parameters:
+--               maximum_bytes_billed: 107374182400
+
 -- Step 1: Delete the mutable window
 DELETE FROM `project.dataset.ga4_events_enriched`
 WHERE event_date >= date_sub(current_date(), interval 3 day);
@@ -36,12 +53,29 @@ WITH raw_events AS (
   SELECT
     parse_date('%Y%m%d', event_date) AS event_date,
     user_pseudo_id,
+    user_id,
     event_name,
     event_timestamp,
+    event_bundle_sequence_id,
+    -- 2026: Use native collected_traffic_source instead of parsing event_params
+    collected_traffic_source.source AS traffic_source,
+    collected_traffic_source.medium AS traffic_medium,
+    collected_traffic_source.campaign AS traffic_campaign,
+    -- 2026: session_traffic_source_last_click is the most reliable
+    -- session-level attribution field in BigQuery
+    session_traffic_source_last_click.source AS session_source,
+    session_traffic_source_last_click.medium AS session_medium,
+    session_traffic_source_last_click.campaign AS session_campaign,
+    -- 2026: privacy_info is critical for Consent Mode v2 (EEA traffic)
+    privacy_info.analytics_storage AS analytics_storage_consent,
+    privacy_info.ads_storage AS ads_storage_consent,
+    -- 2026: is_active_user distinguishes engaged from bounce sessions
+    is_active_user,
     -- Safe access: intraday lacks some attribution fields
     (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
-    ecommerce
+    ecommerce,
+    'daily' AS _export_type
   FROM `project.analytics_123456789.events_*`
   WHERE _table_suffix BETWEEN
     format_date('%Y%m%d', date_sub(current_date(), interval 3 day))
@@ -53,36 +87,40 @@ WITH raw_events AS (
   SELECT
     parse_date('%Y%m%d', regexp_extract(_table_suffix, r'intraday_(\d+)')) AS event_date,
     user_pseudo_id,
+    user_id,
     event_name,
     event_timestamp,
+    event_bundle_sequence_id,
+    collected_traffic_source.source AS traffic_source,
+    collected_traffic_source.medium AS traffic_medium,
+    collected_traffic_source.campaign AS traffic_campaign,
+    session_traffic_source_last_click.source AS session_source,
+    session_traffic_source_last_click.medium AS session_medium,
+    session_traffic_source_last_click.campaign AS session_campaign,
+    privacy_info.analytics_storage AS analytics_storage_consent,
+    privacy_info.ads_storage AS ads_storage_consent,
+    is_active_user,
     (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id,
-    ecommerce
+    ecommerce,
+    'intraday' AS _export_type
   FROM `project.analytics_123456789.events_intraday_*`
   WHERE _table_suffix BETWEEN
     format_date('intraday_%Y%m%d', date_sub(current_date(), interval 3 day))
     AND format_date('intraday_%Y%m%d', current_date())
 ),
 
--- De-duplicate: if a row exists in both daily and intraday, keep daily
--- The daily export is more complete (has attribution fields intraday lacks)
+-- De-duplicate: if a row exists in both daily and intraday, keep daily.
+-- The daily export is more complete (has attribution fields intraday lacks).
+-- NOTE: user_pseudo_id + event_timestamp + event_name is NOT guaranteed unique.
+-- For true dedup, add event_bundle_sequence_id or accept near-duplicates.
 deduped AS (
-  SELECT
-    event_date,
-    user_pseudo_id,
-    event_name,
-    event_timestamp,
-    page_location,
-    ga_session_id,
-    ecommerce,
-    -- Track which export type won (useful for debugging)
-    _export_type
+  SELECT * EXCEPT(_export_type, rn)
   FROM (
     SELECT
       *,
-      'daily' AS _export_type,
       ROW_NUMBER() OVER (
-        PARTITION BY user_pseudo_id, event_timestamp, event_name
+        PARTITION BY user_pseudo_id, event_timestamp, event_name, event_bundle_sequence_id
         ORDER BY CASE WHEN _export_type = 'daily' THEN 1 ELSE 2 END
       ) AS rn
     FROM raw_events
