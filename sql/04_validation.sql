@@ -1,15 +1,32 @@
 /*
-  Validation Queries for GA4 Incremental Pipelines (2026)
+  Dataform configuration (save as .sqlx in your Dataform project):
 
-  I run these after every refresh. They catch:
-  - Missing data (pipeline didn't run, permissions issue)
-  - Schema drift (Google added a new field, existing query broke)
-  - Tracking outages (event volume dropped 90% = broken GTM)
-  - Duplicate rows (de-duplication failed)
-  - Attribution gaps (all sessions direct = UTM params lost)
-  - Consent Mode issues (analytics_storage = 'Denied' spikes)
-  - Cost overruns (query scanned 10x expected bytes)
+  config {
+    type: "operations",
+    schema: "analytics",
+    name: "validate_ga4_pipeline"
+  }
+
+  -- Or run as an assertion:
+  config {
+    type: "assertion",
+    schema: "analytics",
+    name: "assert_ga4_data_quality"
+  }
 */
+
+-- ============================================================================
+-- Validation Queries for GA4 Incremental Pipelines (2026)
+-- ============================================================================
+-- I run these after every refresh. They catch:
+-- - Missing data (pipeline didn't run, permissions issue)
+-- - Schema drift (Google added a new field, existing query broke)
+-- - Tracking outages (event volume dropped 90% = broken GTM)
+-- - Duplicate rows (de-duplication failed)
+-- - Attribution gaps (all sessions direct = UTM params lost)
+-- - Consent Mode issues (analytics_storage = 'Denied' spikes)
+-- - Cost overruns (query scanned 10x expected bytes)
+-- ============================================================================
 
 -- ============================================================================
 -- CHECK 0: Cost Guardrail (run this FIRST)
@@ -24,7 +41,7 @@ SELECT
   total_bytes_billed / 1e12 * 6.25 AS estimated_cost_usd  -- on-demand pricing
 FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
 WHERE job_type = 'QUERY'
-  AND creation_time >= timestamp_sub(current_timestamp(), interval 1 hour)
+  AND creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
   AND query LIKE '%stg_ga4__events%'
 ORDER BY creation_time DESC
 LIMIT 10;
@@ -38,13 +55,13 @@ WITH daily_counts AS (
     event_date,
     COUNT(*) AS row_count
   FROM `project.dataset.stg_ga4__events`
-  WHERE event_date >= date_sub(current_date(), interval 8 day)
+  WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 DAY)
   GROUP BY 1
 ),
 avg_7d AS (
   SELECT AVG(row_count) AS avg_rows
   FROM daily_counts
-  WHERE event_date < current_date()
+  WHERE event_date < CURRENT_DATE()
 )
 
 SELECT
@@ -54,7 +71,7 @@ SELECT
   ROUND((d.row_count - a.avg_rows) / a.avg_rows * 100, 1) AS pct_change
 FROM daily_counts d
 CROSS JOIN avg_7d a
-WHERE d.event_date = current_date()
+WHERE d.event_date = CURRENT_DATE()
   -- Alert if today's row count is < 50% or > 200% of the 7-day average
   AND (d.row_count < a.avg_rows * 0.5 OR d.row_count > a.avg_rows * 2.0);
 
@@ -70,7 +87,7 @@ SELECT
   -- 2026: Check native traffic_source fields (should not be null on first hit)
   COUNTIF(session_source IS NULL) / COUNT(*) AS pct_null_session_source
 FROM `project.dataset.stg_ga4__events`
-WHERE event_date >= date_sub(current_date(), interval 3 day)
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
 GROUP BY 1
 HAVING pct_null_user_pseudo_id > 0.01
     OR pct_null_timestamp > 0
@@ -86,7 +103,7 @@ WITH daily_events AS (
     event_name,
     COUNT(*) AS event_count
   FROM `project.dataset.stg_ga4__events`
-  WHERE event_date >= date_sub(current_date(), interval 7 day)
+  WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
   GROUP BY 1, 2
 ),
 baseline AS (
@@ -94,7 +111,7 @@ baseline AS (
     event_name,
     AVG(event_count) AS avg_count
   FROM daily_events
-  WHERE event_date < current_date()
+  WHERE event_date < CURRENT_DATE()
   GROUP BY 1
 )
 
@@ -106,7 +123,7 @@ SELECT
   ROUND((d.event_count - b.avg_count) / b.avg_count * 100, 1) AS pct_change
 FROM daily_events d
 JOIN baseline b ON d.event_name = b.event_name
-WHERE d.event_date = current_date()
+WHERE d.event_date = CURRENT_DATE()
   -- Alert if any event dropped > 70% vs baseline
   AND d.event_count < b.avg_count * 0.3
 ORDER BY pct_change;
@@ -126,7 +143,7 @@ SELECT
   event_bundle_sequence_id,
   COUNT(*) AS duplicate_count
 FROM `project.dataset.stg_ga4__events`
-WHERE event_date >= date_sub(current_date(), interval 3 day)
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
 GROUP BY 1, 2, 3, 4, 5
 HAVING COUNT(*) > 2;
 
@@ -153,14 +170,14 @@ FROM (
     session_medium,
     ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, ga_session_id ORDER BY event_timestamp) AS rn
   FROM `project.dataset.stg_ga4__events`
-  WHERE event_date >= date_sub(current_date(), interval 3 day)
+  WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
 )
 WHERE rn = 1
 GROUP BY 1
 HAVING pct_direct > 80;
 
 -- ============================================================================
--- CHECK 6: Consent Mode v2 (2026 — Critical for EEA Traffic)
+-- CHECK 6: Consent Mode v2 (2026 -- Critical for EEA Traffic)
 -- ============================================================================
 
 SELECT
@@ -173,7 +190,7 @@ SELECT
     1
   ) AS pct_denied
 FROM `project.dataset.stg_ga4__events`
-WHERE event_date >= date_sub(current_date(), interval 3 day)
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
 GROUP BY 1
 -- Alert if > 30% of traffic denies analytics_storage (investigate CMP/banner)
 HAVING pct_denied > 30;
@@ -191,7 +208,7 @@ SELECT
   COUNT(*) AS registration_sessions,
   COUNTIF(session_source = '(direct)' AND session_medium = '(none)') AS direct_after_registration
 FROM `project.dataset.fct_ga4_sessions`
-WHERE event_date >= date_sub(current_date(), interval 3 day)
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
   AND has_registration_mid_session = TRUE
 GROUP BY 1
 HAVING registration_sessions > 10;

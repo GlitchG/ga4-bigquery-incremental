@@ -1,63 +1,58 @@
 /*
-  Pattern 1: Insert Overwrite (Recommended for 2026)
+  Dataform configuration (save as .sqlx in your Dataform project):
 
-  Replace the last 3 days of data on every run. This handles:
-  - Intraday updates (today's data changes hourly)
-  - Daily export backfills (Google re-processes yesterday with corrections)
-  - Late-arriving native events (up to 72h delay)
-  - Measurement Protocol events (see Pattern 5 for backdated MP)
+  config {
+    type: "incremental",
+    schema: "analytics",
+    bigquery: {
+      partitionBy: "event_date",
+      clusterBy: ["event_name"],
+      requirePartitionFilter: true
+    }
+  }
 
-  WHY NOT MERGE?
-  BigQuery MERGE scans the entire target partition to find matching rows.
-  On 100M+ row tables, that's €3-5/day vs €0.40-0.80 for insert overwrite.
-  At scale, this matters.
+  js {
+    const lookbackDays = 3;
+  }
 
-  2026 UPDATES vs 2023-era advice:
-  - dbt: use incremental_predicates (partitions= is deprecated in dbt 1.7+)
-  - Uses native collected_traffic_source (not event_params parsing)
-  - Includes privacy_info for Consent Mode v2 compliance
-  - Includes session_traffic_source_last_click for reliable attribution
+  pre_operations {
+    delete from ${self()} where event_date >= date_sub(current_date(), interval 3 day);
+  }
 */
 
 -- ============================================================================
--- dbt config (2026 syntax)
+-- Pattern 1: Insert Overwrite (Recommended for Dataform / BigQuery)
 -- ============================================================================
--- {{ config(
---     materialized='incremental',
---     partition_by={'field': 'event_date', 'data_type': 'date'},
---     incremental_strategy='insert_overwrite',
---     incremental_predicates=[
---       "event_date >= date_sub(current_date(), interval 3 day)"
---     ],
---     on_schema_change='sync_all_columns'
--- ) }}
-
+-- Replace the last 3 days of data on every run. Leave everything older untouched.
+-- This handles:
+--   - Intraday updates (today's data changes hourly)
+--   - Daily export backfills (Google re-processes yesterday with corrections)
+--   - Late-arriving native events (up to 72h delay)
+--   - Measurement Protocol events (see Pattern 5 for backdated MP)
+--
+-- WHY NOT MERGE?
+-- BigQuery MERGE scans the entire target partition to find matching rows.
+-- On 100M+ row tables, that's €3-5/day vs €0.40-0.80 for insert overwrite.
+-- At scale, this matters.
+--
+-- 2026 UPDATES vs 2023-era advice:
+-- - Uses native collected_traffic_source (not event_params parsing)
+-- - Uses session_traffic_source_last_click for reliable attribution
+-- - Includes privacy_info for Consent Mode v2 (mandatory EEA since 2024)
+-- - Includes is_active_user for engaged vs bounce distinction
+-- - Cost guardrail: always set maximum_bytes_billed in your Dataform config
 -- ============================================================================
--- Pure SQL equivalent (Dataform, Airflow, manual)
--- ============================================================================
 
--- COST GUARDRAIL: Always set maximum_bytes_billed in your job config
--- BigQuery: --maximum_bytes_billed=107374182400  (100 GiB = ~€0.50)
--- dbt:      +jobs:<job_name>:
---             +extra_parameters:
---               maximum_bytes_billed: 107374182400
-
--- Step 1: Delete the mutable window
-DELETE FROM `project.dataset.ga4_events_enriched`
-WHERE event_date >= date_sub(current_date(), interval 3 day);
-
--- Step 2: Insert fresh data for the last 3 days
-INSERT INTO `project.dataset.ga4_events_enriched`
 WITH raw_events AS (
   -- Daily export: complete, stable, 24h latency
   SELECT
-    parse_date('%Y%m%d', event_date) AS event_date,
+    PARSE_DATE('%Y%m%d', event_date) AS event_date,
     user_pseudo_id,
     user_id,
     event_name,
     event_timestamp,
     event_bundle_sequence_id,
-    -- 2026: Use native collected_traffic_source instead of parsing event_params
+    -- 2026: Native traffic_source fields (stop parsing event_params)
     collected_traffic_source.source AS traffic_source,
     collected_traffic_source.medium AS traffic_medium,
     collected_traffic_source.campaign AS traffic_campaign,
@@ -78,14 +73,14 @@ WITH raw_events AS (
     'daily' AS _export_type
   FROM `project.analytics_123456789.events_*`
   WHERE _table_suffix BETWEEN
-    format_date('%Y%m%d', date_sub(current_date(), interval 3 day))
-    AND format_date('%Y%m%d', current_date())
+    FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
+    AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
 
   UNION ALL
 
   -- Intraday export: real-time, 1h latency, incomplete
   SELECT
-    parse_date('%Y%m%d', regexp_extract(_table_suffix, r'intraday_(\d+)')) AS event_date,
+    PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(_table_suffix, r'intraday_(\d+)')) AS event_date,
     user_pseudo_id,
     user_id,
     event_name,
@@ -106,8 +101,8 @@ WITH raw_events AS (
     'intraday' AS _export_type
   FROM `project.analytics_123456789.events_intraday_*`
   WHERE _table_suffix BETWEEN
-    format_date('intraday_%Y%m%d', date_sub(current_date(), interval 3 day))
-    AND format_date('intraday_%Y%m%d', current_date())
+    FORMAT_DATE('intraday_%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY))
+    AND FORMAT_DATE('intraday_%Y%m%d', CURRENT_DATE())
 ),
 
 -- De-duplicate: if a row exists in both daily and intraday, keep daily.

@@ -1,8 +1,10 @@
-# GA4 BigQuery Incremental Refresh Patterns (2026)
+# GA4 BigQuery Incremental Refresh Patterns (Dataform Native)
 
-I maintain GA4 BigQuery pipelines for clients who spend €50K–€500K/month on ads. One thing you learn fast: **running full refreshes on GA4 event data is prohibitively expensive**. A single backfill can cost €200+ in BigQuery scan charges.
+I maintain GA4 BigQuery pipelines for clients on Google Cloud. **Dataform is my tool of choice** — it's native to BigQuery, compiles to pure SQL, and doesn't require a separate orchestrator for simple schedules.
 
-This repo shows the **patterns I actually use in production in 2026** — with cost estimates, trade-offs, and what changed from the 2023-era advice still circulating online.
+One thing you learn fast: **running full refreshes on GA4 event data is prohibitively expensive**. A single backfill can cost €200+ in BigQuery scan charges. The 2023-era "merge with unique key" advice breaks down at scale because GA4 events have no true unique key, and BigQuery `MERGE` scans entire partitions.
+
+This repo shows the **patterns I actually deploy in Dataform** — with compiled SQL, cost estimates, and 2026-native BigQuery features.
 
 ## The GA4 Data Problem
 
@@ -22,21 +24,33 @@ Challenges this creates:
 6. **Consent Mode v2**: `privacy_info` struct tells you if EEA traffic granted consent (mandatory since March 2024)
 7. **Registration session bug**: When `user_id` appears mid-session, GA4 UI resets attribution to `(direct) / (none)`
 
+## Why Dataform?
+
+| Feature | Dataform (GCP Native) | dbt (3rd Party) |
+|---------|----------------------|-----------------|
+| **Compilation** | Compiles to pure SQL in BigQuery | Requires dbt Cloud or self-hosted |
+| **Scheduling** | Native Dataform Workflows (cron) | Requires Airflow/dbt Cloud |
+| **Dependencies** | Auto-resolved via `ref()` in same project | Requires manifest parsing |
+| **Cost** | Free (part of BigQuery) | dbt Cloud ~$100-300/seat |
+| **Git** | Native Git integration in Console | External |
+| **2026 syntax** | `config { type: "incremental" }` | Jinja `{{ config(...) }}` |
+
+**I use Dataform for GCP-native clients; dbt when the client already has a dbt stack.** This repo is Dataform-first.
+
 ## 2026 vs 2023: What Changed
 
 | Topic | 2023 Advice | 2026 Best Practice |
 |-------|-------------|-------------------|
-| **dbt syntax** | `partitions=[...]` | `incremental_predicates` (dbt 1.7+, late 2023) |
 | **Session attribution** | Parse UTMs from `page_location` | Use `session_traffic_source_last_click` (native BQ field) |
 | **Traffic source** | Extract from `event_params` | Use `collected_traffic_source` (native struct) |
 | **EU compliance** | Ignored | Include `privacy_info` for Consent Mode v2 |
-| **Cost guardrails** | Not mentioned | Set `maximum_bytes_billed` on every job |
+| **Cost guardrails** | Not mentioned | Set `maximum_bytes_billed` on every compilation |
 | **Dedup key** | `user_pseudo_id + timestamp + event_name` | Add `event_bundle_sequence_id`; document non-uniqueness |
 | **MP backfill** | Not addressed | Monthly 60-day deep backfill (Pattern 5) |
 
 ## The Patterns
 
-### Pattern 1: Insert Overwrite (Recommended for 2026)
+### Pattern 1: Insert Overwrite (Recommended)
 
 Replace the last 3 days of data on every run. Leave everything older untouched.
 
@@ -84,11 +98,43 @@ The 3-day insert overwrite (Pattern 1) silently misses **Measurement Protocol ev
 
 **Solution:** Keep the fast 3-day overwrite for daily freshness, but run a monthly job that rebuilds the last 60-90 days.
 
-**Schedule:** 1st of each month at 03:00 UTC.
+**Schedule:** 1st of each month at 03:00 UTC via Dataform Workflows.
 
 **Cost impact:** One monthly run of 60 days ≈ €8-15.
 
 See: [`sql/05_measurement_protocol_backfill.sql`](sql/05_measurement_protocol_backfill.sql)
+
+## Dataform Project Structure
+
+```
+gcp-project/
+├── definitions/
+│   ├── 01_insert_overwrite.sqlx
+│   ├── 02_date_checkpoint.sqlx
+│   ├── 03_two_tier_pipeline.sqlx
+│   ├── 04_validation.sqlx
+│   └── 05_measurement_protocol_backfill.sqlx
+├── includes/
+│   └── constants.js          # project_id, dataset, lookback windows
+├── workflow_settings.yaml     # defaultProject, defaultDataset, schedule
+└── dataform.json              # legacy v1 config (optional)
+```
+
+**`workflow_settings.yaml`:**
+```yaml
+defaultProject: my-gcp-project
+defaultDataset: analytics
+defaultLocation: EU
+```
+
+**`includes/constants.js`:**
+```javascript
+const PROJECT_ID = "my-gcp-project";
+const GA4_DATASET = "analytics_123456789";
+const LOOKBACK_DAYS = 3;
+
+module.exports = { PROJECT_ID, GA4_DATASET, LOOKBACK_DAYS };
+```
 
 ## Cost Comparison
 
@@ -103,14 +149,15 @@ Pattern tested on a GA4 property with ~50M events/month:
 
 Costs are BigQuery scan charges only. Your mileage varies by event volume and column selection.
 
-**Always set `maximum_bytes_billed`** in your job config. A runaway query can cost €50+ before you notice.
+**Always set `maximum_bytes_billed`** in your Dataform workflow config. A runaway query can cost €50+ before you notice.
 
 ```yaml
-# dbt example
-models:
-  ga4_project:
-    +extra_parameters:
-      maximum_bytes_billed: 107374182400  # 100 GiB = ~€0.50
+# In workflow_settings.yaml or per-action config
+bigquery:
+  labels:
+    cost_center: marketing_analytics
+  additionalOptions:
+    maximumBytesBilled: "107374182400"  # 100 GiB = ~€0.50
 ```
 
 ## When to Use What
@@ -128,12 +175,14 @@ models:
 
 ```
 sql/
-  01_insert_overwrite.sql              # Pattern 1: Replace 3-day window (2026 syntax)
+  01_insert_overwrite.sql              # Pattern 1: Replace 3-day window
   02_date_checkpoint.sql               # Pattern 2: High-water mark append
   03_two_tier_pipeline.sql             # Pattern 3: Source mart + business models
   04_validation.sql                    # Data quality checks (7 guardrails)
   05_measurement_protocol_backfill.sql # Pattern 5: 60-day monthly rebuild
 ```
+
+> **Note:** These are `.sql` files for readability on GitHub. In Dataform, rename to `.sqlx` and wrap the SQL in `config { ... }` / `pre_operations { ... }` blocks as shown in the file comments.
 
 ## License
 
